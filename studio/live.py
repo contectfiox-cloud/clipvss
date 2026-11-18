@@ -357,6 +357,8 @@ class Session:
         last_clip = max((c.get("made_at", 0) for c in self.job["clips"]), default=self.started_at)
         must = st["must_clip_min"] > 0 and time.time() - last_clip >= st["must_clip_min"] * 60
         verdict = {"t": round(now), "transcript": None, "reaction": None, "trigger": why}
+        if not config.ai_ready():     # no AI set up: clip by loudness and chat instead, so a recording still makes clips
+            return self._loud_check(verdict, ws, now, why, must, recent, "the AI is not set up")
         if len(win) < 8:
             self.skipped += 1
             return self._verdict(verdict, "Skipped: nobody talking")
@@ -370,7 +372,7 @@ class Session:
                                                 n=1 if every <= 2 else 2, must=must)  # Auto (0) asks for one
         except Exception as e:  # noqa: BLE001
             self.job["ai"]["last_error"] = str(e)[-200:]
-            return self._verdict(verdict, "AI error: " + str(e)[-80:])
+            return self._loud_check(verdict, ws, now, why, must, recent, "the AI did not answer")
         self.checks += 1
         self.tokens += tok
         keep = [c for c in cands if c["score"] >= (40 if must else st["min_score"])]
@@ -411,6 +413,49 @@ class Session:
             must = False
             if added >= (1 if every <= 2 else 2):
                 break
+
+    LOUD_SCORE = {"said": 70, "jump": 60, "forced": 40}   # below the default auto-post score (75): checked by a person first
+
+    def _loud_check(self, verdict, ws, now, why, must, recent, because):
+        """The AI is missing or not answering: clip by loudness and chat instead. Only a real moment is clipped
+        (a jump in loudness or chat, or someone saying "clip"), or the loudest stretch when "a clip at least every"
+        is due; the regular timed checks make nothing, or a calm stream would be clipped every few minutes."""
+        st = self.settings
+        if not why and not must:
+            return self._verdict(verdict, f"No AI ({because}): waiting for a loud moment")
+        if len(recent) >= st["live_per_hour"] and not must:
+            self.skipped += 1
+            return self._verdict(verdict, f"Skipped: {st['live_per_hour']} clips this hour already")
+        with self.lock:
+            db = np.array(self.db, dtype=np.float32)
+        have = min(len(db), max(now, self.t_done))
+        if have < st["min_len"]:
+            return self._verdict(verdict, "Skipped: not enough of the stream recorded yet")
+        z = brain.loud_zscore(db[:int(have)])
+        lo, hi = max(0, int(ws)), max(int(ws) + 1, int(now) + 1)
+        if why and why.startswith("Jump"):         # a jump: the loudest second around it, scored with chat too
+            part = z[lo:hi]
+            peak = lo + int(np.argmax(part)) if len(part) else int(now)
+        elif why:                                  # someone said "clip": the moment just before they said it
+            peak = int(now) - self.SAID_AFTER
+        else:                                      # forced: the loudest second since the last check window
+            back = max(0, int(have) - max(int(st["must_clip_min"]) * 60, 60))
+            part = z[back:int(have)]
+            peak = back + int(np.argmax(part)) if len(part) else int(have)
+        length = float(max(st["min_len"], min(st["max_len"], 40)))
+        s = max(0.0, peak - length * 0.6)
+        e = min(float(have), s + length)
+        s = max(0.0, e - length)
+        if any(abs(s - k["start"]) < st["min_gap_min"] * 60 for k in self.job["clips"]):
+            return self._verdict(verdict, "Too close to the last clip")
+        kind = "forced" if not why else "jump" if why.startswith("Jump") else "said"
+        reason = ("the loudest moment, as no clip was made for a while" if kind == "forced"
+                  else "someone said “clip”" if kind == "said" else why[len("Jump: "):])
+        c = {"start": round(s, 2), "end": round(e, 2), "score": self.LOUD_SCORE[kind], "category": "other",
+             "hook": "WAIT FOR IT", "title": "Loud moment", "description": "", "hashtags": [], "highlight_words": [],
+             "reason": f"Picked by loudness ({reason}) because {because}."}
+        self._add_clip(c)
+        return self._verdict(verdict, f"Clipped by loudness: {because}")
 
     def _verdict(self, v, result):
         self.verdicts.append(dict(v, result=result))
