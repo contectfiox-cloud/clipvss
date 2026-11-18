@@ -16,6 +16,8 @@ storage.json
 *.log
 
 # ---- this computer only
+bin/
+ffmpeg/
 .claude/
 CLAUDE.local.md
 .vscode/
